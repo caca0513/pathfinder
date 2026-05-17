@@ -21,59 +21,143 @@
 
 ## 方案设计
 
-### 整体架构：两阶段管线
+### 整体架构：预处理 + 两阶段管线
+
+```mermaid
+flowchart TD
+    Raw[原始文档<br/>bytes/path/email] --> Preprocess[文档预处理<br/>Document Preprocessor]
+
+    Preprocess --> Normalized[NormalizedDocument<br/>text + segments + layout]
+    Preprocess --> PreFail[预处理失败]
+
+    Normalized --> Stage1[Stage 1: 模板性检测<br/>Template-ness]
+
+    Stage1 --> Ensemble{多个检测方案并行<br/>择优合并}
+    Ensemble -->|非模板| NotTemplate[is_template: false]
+    Ensemble -->|是模板| Stage2[Stage 2: 模板识别<br/>Template ID]
+
+    Stage2 -->|已识别| Matched[返回 template_id]
+    Stage2 -->|未匹配| NewCandidate[新建模板候选项]
+
+    NotTemplate --> Output[输出结果]
+    Matched --> Output
+    NewCandidate --> Output
+    PreFail --> Output
+
+    Output --> Feedback[用户二元反馈: 对/错]
+    Feedback --> Queue[积累到待学习队列]
+
+    Queue --> Offline[离线学习引擎]
+    Offline --> Update0[预处理参数调优]
+    Offline --> Update1[Stage1 方案权重/阈值优化]
+    Offline --> Update2[Stage2 增量聚类<br/>DBSCAN/HDBSCAN]
+    Offline --> Update3[模板库更新]
+
+    Update0 -.-> Preprocess
+    Update1 -.-> Stage1
+    Update2 -.-> Stage2
+    Update3 -.-> Stage2
+```
+
+### 文档预处理 (Document Preprocessing)
+
+将各种格式的原始文档转换为统一的 `NormalizedDocument` 结构，供下游所有检测方案共享。
+
+#### 输入
+
+原始文档的多种形态：
+
+| 来源 | 原始格式 | 说明 |
+|------|----------|------|
+| 邮件文件 | `.eml` / `.msg` | 需解析正文（HTML/plain）及附件 |
+| 办公文档 | `.pdf` / `.docx` / `.pptx` | 直接解析或转中间格式 |
+| 扫描件/图片 | `.jpg` / `.png` / `.tiff` | 需 OCR 识别文字 |
+| 网页 | `.html` / `.mhtml` | 需提取正文并去噪 |
+| 纯文本 | `.txt` / `.csv` / `.json` | 轻量解析 |
+
+#### 处理管线
+
+预处理由一组可扩展的 Processor 串联构成，每个 Processor 负责一种特定的转换：
 
 ```
-输入文档
-   │
-   ▼
-┌─────────────────────┐
-│  Stage 1            │
-│  模板性检测          │  ← 规则驱动，零训练数据即可运行
-│  (Template-ness)     │
-└─────────┬───────────┘
-          │
-     ┌────┴────┐
-     ▼         ▼
-  非模板       是模板
-     │         │
-     │         ▼
-     │    ┌─────────────────────┐
-     │    │  Stage 2            │
-     │    │  模板识别            │  ← 增量聚类，在线匹配 + 离线学习
-     │    │  (Template ID)       │
-     │    └─────────┬───────────┘
-     │              │
-     │         ┌────┴────┐
-     │         ▼         ▼
-     │     已识别      未匹配
-     │       │         │
-     │       │         ▼
-     │       │     新建模板候选项
-     │       │
-     ▼       ▼
-  输出结果
-     │
-     ▼
-  用户二元反馈 (对/错)
-     │
-     ▼
-  积累到待学习队列
-     │
-     ▼  (空闲时批量处理)
-  ┌──────────────────────┐
-  │  离线学习引擎          │
-  │  ● Stage1 规则调优     │
-  │  ● Stage2 增量聚类     │
-  │  ● 模板库更新          │
-  └──────────────────────┘
+原始文档 → [FormatDetector] → 格式分发
+  ├── EmailParser    (.eml/.msg)  → 提取正文 + 附件 → 递归处理附件
+  ├── OcrProcessor   (图片/扫描件) → OCR → 文本 + 坐标
+  ├── PdfProcessor   (.pdf)       → 布局分析 → 文本块 + bbox
+  ├── HtmlProcessor  (.html)      → 正文提取 → Markdown / 纯文本
+  ├── DocxProcessor  (.docx)      → 段落解析 → 文本块
+  └── TextProcessor  (.txt/.csv)  → 基础分块
+       │
+       ▼
+  [StructureAnalyzer]             → 段落树、标题层级、表格结构
+       │
+       ▼
+  NormalizedDocument              → 统一输出
 ```
+
+#### 输出：NormalizedDocument
+
+```python
+@dataclass
+class NormalizedDocument:
+    source_path: str | None        # 原始文件路径
+    source_format: str             # 原始格式标识 (pdf/eml/docx/html/txt/…)
+    raw_text: str                  # 纯文本全文（OCR 或解析所得）
+    segments: list[TextSegment]    # 文本块列表（含位置信息）
+    structure: DocumentStructure   # 文档结构树（标题层级、段落、表格）
+    metadata: dict                 # 来源信息、页数、解析耗时等
+    preprocessing_log: list[str]   # 经过的预处理步骤记录
+
+@dataclass
+class DocumentStructure:
+    title: str | None
+    headings: list[HeadingInfo]    # 标题层级
+    paragraphs: list[int]          # 段落对应的 segment 索引
+    tables: list[TableInfo]        # 表格结构
+
+@dataclass
+class TextSegment:
+    text: str
+    bbox: tuple[float, float, float, float] | None  # (x0, y0, x1, y1)
+    font_size: float | None
+    is_heading: bool = False
+    role: str = "body"             # heading / body / header / footer / table_cell
+```
+
+预处理过程应保留完整的解析链路记录（`preprocessing_log`），方便后续排查和调优。
+
+#### 设计要点
+
+- **可插拔**：每个 Processor 实现统一接口，可独立添加/移除/替换
+- **容错**：某个 Processor 失败不应阻塞整个管线，应降级并记录日志
+- **共享复用**：预处理输出的 `NormalizedDocument` 同时供给 Stage 1 的多个检测方案使用，避免重复解析
+- **可拓展**：后期可通过离线学习优化预处理参数（如 OCR 语言模型选择、PDF 解析精度配置）
 
 ### Stage 1：模板性检测
 
 目标：判断文档是否由模板生成，输出 `is_template: bool` + `confidence: float`。
 
-基于规则的启发式打分，每个维度输出 0~1 分，加权求和得到最终模板性分数：
+Stage 1 内部可运行**多个检测方案**（scorer），每个方案独立计算模板性分数，最终通过策略合并择优：
+
+```mermaid
+flowchart LR
+    N[NormalizedDocument] --> Scorer1[启发式规则打分<br/>HeuristicScorer]
+    N --> Scorer2[关键词匹配打分<br/>KeywordScorer]
+    N --> Scorer3[... 后续可拓展]
+
+    Scorer1 --> Ensemble[合并策略<br/>加权平均 / 投票 / 最大值]
+    Scorer2 --> Ensemble
+    Scorer3 --> Ensemble
+
+    Ensemble --> Decision{最终判定}
+    Decision -->|score > high| T[模板]
+    Decision -->|score < low| NT[非模板]
+    Decision -->|low ≤ score ≤ high| Pending[待确认]
+```
+
+#### 内置方案 1：启发式规则打分 (HeuristicScorer)
+
+每个维度输出 0~1 分，加权求和得到模板性分数：
 
 | 特征维度 | 计算方式 | 说明 |
 |----------|----------|------|
@@ -89,13 +173,34 @@
 template_ness = Σ(w_i * score_i)  // 加权求和
 if template_ness > threshold_high  → 判定为模板
 if template_ness < threshold_low   → 判定为非模板
-if threshold_low ≤ template_ness ≤ threshold_high → 低置信度，标记待确认
+else → 低置信度，标记待确认
 ```
 
 **设计要点**：
 - 零数据即可运行，所有特征无需训练
 - 权重和阈值初期可手工设定，后续通过离线学习优化
 - 产出 confidence 供下游决策（如自动通过 / 标记人工审核）
+
+#### 内置方案 2：关键词匹配打分 (KeywordScorer)
+
+对已知模板类型中出现的强特征关键词/正则做匹配计数，归一化为分数：
+
+```
+score = (matched_patterns / total_patterns) * boost_if_cluster
+```
+
+例如已知模板中出现的高频模式：`"账单日期"`、`"本期应还款金额"`、`"信用卡账单"` 等。随着模板库的积累，各模板的 Pattern 集可通过离线学习自动提取。
+
+#### 合并策略
+
+| 策略 | 适用场景 |
+|------|----------|
+| **加权平均** | 各方案独立且互补，根据历史准确率分配权重 |
+| **最大值** | 任何一个方案高置信度即可判定（降低漏判） |
+| **投票** | 多个方案输出等权的 0/1 判定，取多数 |
+| **级联** | 先跑低成本方案，低置信度时再跑高成本方案 |
+
+合并策略可通过离线学习根据历史反馈数据自动选择或调参。
 
 ### Stage 2：模板识别
 
@@ -159,32 +264,74 @@ T3: 积累更多数据，再次离线聚类
 
 ```python
 @dataclass
-class Document:
-    raw_text: str
-    segments: list[TextSegment]
+class RawDocument:
+    """预处理前的原始文档。"""
+    source: str | bytes               # 文件路径或字节流
+    source_format: str                # pdf / eml / docx / html / image / txt
+    metadata: dict                    # 文件名、大小、mime type 等
+
+@dataclass
+class NormalizedDocument:
+    """预处理后的统一文档表示，供下游所有检测方案共享。"""
+    source_path: str | None
+    source_format: str
+    raw_text: str                     # 纯文本全文
+    segments: list[TextSegment]       # 文本块列表（含位置信息）
+    structure: DocumentStructure      # 文档结构树
     metadata: dict
+    preprocessing_log: list[str]      # 经过的预处理步骤
+
+@dataclass
+class DocumentStructure:
+    title: str | None
+    headings: list[HeadingInfo]
+    paragraphs: list[int]
+    tables: list[TableInfo]
+
+@dataclass
+class HeadingInfo:
+    text: str
+    level: int                        # 1/2/3...
+    segment_index: int
+
+@dataclass
+class TableInfo:
+    headers: list[str]
+    rows: list[list[str]]
+    bbox: tuple[float, float, float, float] | None
 
 @dataclass
 class TextSegment:
     text: str
-    bbox: tuple[float, float, float, float]
+    bbox: tuple[float, float, float, float] | None
     font_size: float | None
     is_heading: bool = False
+    role: str = "body"                # heading / body / header / footer / table_cell
+
+@dataclass
+class ScorerResult:
+    """单个检测方案的输出。"""
+    scorer_name: str
+    score: float                      # 0~1
+    confidence: float
+    details: dict[str, float]         # 分维度得分明细
 
 @dataclass
 class DetectionResult:
     is_template: bool
     template_id: str | None
     confidence: float
-    score_breakdown: dict[str, float]  # 各维度得分明细
+    ensemble_decision: str            # 采用的合并策略
+    scorer_results: list[ScorerResult]  # 各方案明细
 
 @dataclass
 class TemplateProfile:
     template_id: str
-    feature_vector: np.ndarray        # 聚类质心
-    text_fingerprint: dict            # TF-IDF 特征
-    layout_signature: dict            # 布局特征
-    sample_count: int                 # 确认文档数
+    feature_vector: np.ndarray
+    text_fingerprint: dict
+    layout_signature: dict
+    pattern_set: set[str]             # 强特征关键词/正则
+    sample_count: int
     first_seen: datetime
     last_updated: datetime
 
@@ -192,36 +339,63 @@ class TemplateProfile:
 class Feedback:
     document_id: str
     system_output: DetectionResult
-    user_correct: bool                # True=对, False=错
+    user_correct: bool
     timestamp: datetime
 ```
 
 ## 接口定义
 
 ```python
+class DocumentPreprocessor:
+    def process(self, raw: RawDocument) -> NormalizedDocument | None:
+        """预处理管线：格式识别 → 解析/OCR → 结构分析 → NormalizedDocument。"""
+
+    def register_processor(self, fmt: str, processor: Processor) -> None:
+        """注册某种格式对应的 Processor。"""
+
+class Processor(ABC):
+    @abstractmethod
+    def process(self, raw: RawDocument) -> NormalizedDocument:
+        """单个格式的解析逻辑。"""
+
+class Stage1Scorer(ABC):
+    """Stage 1 检测方案基类，所有 Scorer 实现此接口。"""
+    @abstractmethod
+    def score(self, doc: NormalizedDocument) -> ScorerResult:
+        """计算模板性分数。"""
+
+class ScorerEnsemble:
+    def __init__(self, scorers: list[Stage1Scorer], strategy: str = "weighted_avg"):
+        """初始化多个检测方案 + 合并策略。"""
+
+    def evaluate(self, doc: NormalizedDocument) -> DetectionResult:
+        """运行所有 scorer，按策略合并结果。"""
+
+    def set_strategy(self, strategy: str, params: dict = None) -> None:
+        """切换合并策略。"""
+
 class TemplateDetector:
-    def detect(self, document: Document) -> DetectionResult:
-        """两阶段检测：先判模板性，再识别模板类型。"""
+    def detect(self, raw: RawDocument) -> DetectionResult:
+        """预处理 → Stage1(多方案择优) → Stage2。"""
+
+    def detect_from_normalized(self, doc: NormalizedDocument) -> DetectionResult:
+        """跳过预处理，直接由归一化文档开始检测。"""
 
     def record_feedback(self, feedback: Feedback) -> None:
         """记录用户反馈，加入待学习队列。"""
 
     def learn(self) -> LearnReport:
-        """离线学习：聚类发现模板 + 规则调优。返回本次学习报告。"""
+        """离线学习：预处理参数调优 + 方案权重/阈值优化 + 聚类 + 模板库更新。"""
 
 class TemplateLibrary:
-    def match(self, document: Document) -> tuple[str | None, float]:
+    def match(self, doc: NormalizedDocument) -> tuple[str | None, float]:
         """与已知模板匹配，返回 (template_id, similarity)。"""
 
-    def add_candidate(self, document: Document) -> str:
+    def add_candidate(self, doc: NormalizedDocument) -> str:
         """创建新的模板候选项，返回临时 ID。"""
 
-    def cluster_and_update(self, documents: list[Document]) -> list[TemplateProfile]:
+    def cluster_and_update(self, docs: list[NormalizedDocument]) -> list[TemplateProfile]:
         """对文档集合做聚类，发现/更新模板类型。"""
-
-class TemplateNessScorer:
-    def score(self, document: Document) -> tuple[float, dict[str, float]]:
-        """计算模板性分数，返回 (总分, 各维度明细)。"""
 ```
 
 ## 评价指标
@@ -248,18 +422,34 @@ class TemplateNessScorer:
 
 ```
 TemplateDetector
-  ├── TemplateNessScorer     # Stage 1：模板性打分
-  │     └── FeatureComputer  # 各维度特征计算
-  ├── TemplateLibrary        # 模板库管理
-  │     ├── TemplateMatcher  # 在线匹配
-  │     └── TemplateLearner  # 离线聚类学习
-  └── FeedbackStore          # 用户反馈存储与待学习队列
+  ├── DocumentPreprocessor          # 预处理管线
+  │     ├── FormatDetector          # 格式识别
+  │     ├── EmailParser             # .eml/.msg 解析
+  │     ├── OcrProcessor            # 图片/扫描件 OCR
+  │     ├── PdfProcessor            # PDF 布局解析
+  │     ├── HtmlProcessor           # HTML 正文提取
+  │     ├── DocxProcessor           # DOCX 解析
+  │     └── StructureAnalyzer       # 文档结构分析
+  ├── ScorerEnsemble                # Stage 1：多方案合并
+  │     ├── HeuristicScorer         # 启发式规则打分
+  │     ├── KeywordScorer           # 关键词匹配打分
+  │     └── ...                     # 后续可拓展
+  ├── TemplateLibrary               # 模板库管理
+  │     ├── TemplateMatcher         # 在线匹配
+  │     └── TemplateLearner         # 离线聚类学习
+  └── FeedbackStore                 # 用户反馈存储与待学习队列
 ```
 
 ## 当前阶段任务
 
-1. 定义核心数据结构：`Document`、`TextSegment`、`DetectionResult`、`Feedback`
-2. 实现 `TemplateNessScorer`：完成 5 个维度的特征计算与加权打分
-3. 实现 `TemplateLibrary` 的基础存储与加载
-4. 实现 `TemplateMatcher`：基于 TF-IDF + 余弦相似度的在线匹配
-5. 实现 `TemplateDetector.detect()` 两阶段流程串联
+1. 定义核心数据结构：`RawDocument`、`NormalizedDocument`、`DetectionResult`、`ScorerResult`、`Feedback`
+2. 实现 `DocumentPreprocessor` 框架：
+   - 定义 `Processor` 抽象基类
+   - 实现 `FormatDetector` 格式识别与分发
+   - 实现 `TextProcessor` 纯文本/CSV 解析（最低可行版本）
+   - 实现 `StructureAnalyzer` 基础段落/标题分析
+3. 实现 `HeuristicScorer`（内置方案 1）：完成 5 个维度的特征计算与加权打分
+4. 实现 `ScorerEnsemble`：支持多方案注册与合并策略
+5. 实现 `TemplateLibrary` 的基础存储与加载
+6. 实现 `TemplateMatcher`：基于 TF-IDF + 余弦相似度的在线匹配
+7. 实现 `TemplateDetector.detect()` 全流程串联（预处理 → Stage 1 → Stage 2）
